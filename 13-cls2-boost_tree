@@ -1,0 +1,369 @@
+# 模型机器---R语言tidymodels包机器学习分类与回归模型---二分类---xgboost
+
+# https://www.tidymodels.org/find/parsnip/
+# https://parsnip.tidymodels.org/reference/boost_tree.html
+# https://parsnip.tidymodels.org/reference/details_boost_tree_xgboost.html
+
+load("tune_xgboost.Rdata")
+library(tidymodels)
+
+# 读取数据
+Heart <- readr::read_csv(file.choose())
+colnames(Heart)
+
+# 修正变量类型
+# 将分类变量转换为factor
+for(i in c(3,4,7,8,10,12,14,15)){
+  Heart[[i]] <- factor(Heart[[i]])
+}
+# 变量类型修正后数据概况
+skimr::skim(Heart)
+
+# 数据拆分
+set.seed(4321)
+datasplit <- initial_split(Heart, prop = 0.75, strata = N_stage)
+traindata <- training(datasplit)
+testdata <- testing(datasplit)
+
+# 数据预处理
+# 先对照训练集写配方
+datarecipe <- recipe(N_stage ~ ., traindata) %>%
+  step_naomit(all_predictors(), skip = F) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  prep()
+datarecipe
+ 
+# 按方处理训练集和测试集
+traindata2 <- bake(datarecipe, new_data = NULL)
+testdata2 <- bake(datarecipe, new_data = testdata)
+test2= bake(datarecipe, new_data = test)
+
+
+table()
+
+load("tune_xgboost.Rdata")
+# 数据预处理后数据概况
+skimr::skim(traindata2)
+skimr::skim(testdata2)
+skimr::skim(test2)
+
+# 训练模型
+# 设定模型
+
+model_xgboost <- boost_tree(
+  mode = "classification",
+  engine = "xgboost",
+  mtry = tune(),
+  trees = 1300,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  stop_iter = 20
+) %>%
+  set_args(validation = 0.2)
+model_xgboost
+
+# workflow
+wk_xgboost <- 
+  workflow() %>%
+  add_model(model_xgboost) %>%
+  add_formula(N_stage ~ .)
+wk_xgboost
+
+# 重抽样设定-5折交叉验证
+set.seed(42.4)
+folds <- vfold_cv(traindata2, v = 10)
+folds
+
+# 超参数寻优范围
+hpset <- parameters(
+  mtry(range = c(2, 8)),
+  min_n(range = c(10, 20)),
+  tree_depth(range = c(1, 4)),
+  learn_rate(range = c(-3, -1)),
+  loss_reduction(range = c(-5, 0)),
+  sample_prop(range = c(0.8, 1))
+)
+set.seed(42.5)
+# grid_regular()
+hpgrid <- grid_random(
+  hpset, size = 10
+)
+hpgrid
+
+
+# 交叉验证随机搜索过程
+set.seed(42.4)
+tune_xgboost <- wk_xgboost %>%
+  tune_grid(resamples = folds,
+            grid = hpgrid,
+            metrics=metric_set(roc_auc,accuracy,pr_auc),
+            control = control_grid(save_pred = T, verbose = T))
+save(tune_xgboost,file = "tune_xgboost.Rdata")
+# 图示交叉验证结果
+tuneresult <- tune_xgboost %>%
+  collect_metrics()
+autoplot(tune_xgboost)
+
+# 经过交叉验证得到的最优超参数
+hpbest <- tune_xgboost %>%
+  select_best(metric = "roc_auc")
+hpbest
+
+# 采用最优超参数组合训练最终模型
+set.seed(42.2)
+final_xgboost <- wk_xgboost %>%
+  finalize_workflow(hpbest) %>%
+  fit(traindata2)
+final_xgboost
+
+# 提取最终的算法模型
+final_xgboost2 <- final_xgboost %>%
+  extract_fit_engine()
+
+importance_matrix <- xgb.importance(model = final_xgboost2)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix,
+                    measure = "Cover",
+                    col = "skyblue")
+# SHAP
+xgb.plot.shap(data = as.matrix(traindata2[,-7]), 
+              model = final_xgboost2,
+              top_n = 5)
+
+library(SHAPforxgboost)
+shap <- shap.prep(final_xgboost2, 
+                  X_train = as.matrix(traindata2[,-7]))
+shap.plot.summary(shap) +
+  labs(title = "SHAP for XGBoost") +
+  theme(axis.text.y = element_text(size = 15))
+
+
+# 应用模型-预测训练集
+predtrain_xgboost <- final_xgboost %>%
+  predict(new_data = traindata2, type = "prob") %>%
+  bind_cols(traindata2 %>% select(N_stage))
+predtrain_xgboost
+# 评估模型ROC曲线-训练集上
+trainroc4 <- predtrain_xgboost %>%
+  roc_curve(N_stage, .pred_N0, event_level = "first") %>%
+  mutate(dataset = "train")
+trainroc4
+autoplot(trainroc4)
+ 
+# 约登法则对应的p值
+yueden_xgboost <- trainroc4 %>%
+  mutate(yueden = sensitivity + specificity - 1) %>%
+  slice_max(yueden) %>%
+  pull(.threshold)
+yueden_xgboost
+# 预测概率+约登法则=预测分类
+predtrain_xgboost2 <- predtrain_xgboost %>%
+  mutate(.pred_class = 
+           factor(ifelse(.pred_N0 >= yueden_xgboost, "N0", "N1")))
+# 混淆矩阵
+cmtrain_xgboost <- predtrain_xgboost2 %>%
+  conf_mat(truth = N_stage, estimate = .pred_class)
+cmtrain_xgboost
+autoplot(cmtrain_xgboost, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  theme(text = element_text(size = 15))
+# 合并指标
+cmtrain_xgboost %>%
+  summary() %>%
+  bind_rows(predtrain_xgboost %>%
+              roc_auc(N_stage, .pred_N0))
+
+
+# 应用模型-预测测试集
+predtest_xgboost <- final_xgboost %>%
+  predict(new_data = testdata2, type = "prob") %>%
+  bind_cols(testdata2 %>% select(N_stage))
+predtest_xgboost
+# 评估模型ROC曲线-测试集上
+testroc4 <- predtest_xgboost %>%
+  roc_curve(N_stage, .pred_N0) %>%
+  mutate(dataset = "test")
+autoplot(testroc4)
+save(testroc4,file = "testroc4.Rdata")
+
+# 预测概率+约登法则=预测分类
+predtest_xgboost2 <- predtest_xgboost %>%
+  mutate(.pred_class = 
+           factor(ifelse(.pred_N0 >= yueden_xgboost, "N0", "N1")))
+# 混淆矩阵
+cmtest_xgboost <- predtest_xgboost2 %>%
+  conf_mat(truth = N_stage, estimate = .pred_class)
+cmtest_xgboost
+autoplot(cmtest_xgboost, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  theme(text = element_text(size = 15))
+# 合并指标
+cmtest_xgboost %>%
+  summary() %>%
+  bind_rows(predtest_xgboost %>%
+              roc_auc(N_stage, .pred_N0))
+
+
+# 合并训练集和测试集上ROC曲线
+trainroc4 %>%
+  bind_rows(testroc4,Extestroc4) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test","Externaltest"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  theme_bw()
+
+load("ll.Rdata")
+save(final_xgboost,file = "xgb.Rdata")
+ll$xgb_prob=predtrain_xgboost2$.pred_N1
+kk$xgb_prob=predtest_xgboost2$.pred_N1
+save(trainroc4,file = "trainroc4.Rdata")
+save(testroc4,file = "testroc4.Rdata")
+save(ll,file = "ll.Rdata")
+save(kk,file = "kk.Rdata")
+
+
+
+
+
+
+
+
+colnames(testdata)
+# 应用模型-预测测试集
+predtest_xgboost <- final_xgboost %>%
+  predict(new_data = test2, type = "prob") %>%
+  bind_cols(test2 %>% select(N_stage))
+predtest_xgboost
+# 评估模型ROC曲线-测试集上
+Extestroc4 <- predtest_xgboost %>%
+  roc_curve(N_stage, .pred_N0) %>%
+  mutate(dataset = "test")
+autoplot(Extestroc4)
+save(Extestroc4,file = "Extestroc4.Rdata")
+
+
+# 预测概率+约登法则=预测分类
+predtest_xgboost2 <- predtest_xgboost %>%
+  mutate(.pred_class = 
+           factor(ifelse(.pred_N0 >= yueden_xgboost, "N0", "N1")))
+jj$xgb_prob=predtest_xgboost2$.pred_N1
+# 混淆矩阵
+cmtest_xgboost <- predtest_xgboost2 %>%
+  conf_mat(truth = N_stage, estimate = .pred_class)
+cmtest_xgboost
+autoplot(cmtest_xgboost, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  theme(text = element_text(size = 15))
+# 合并指标
+cmtest_xgboost %>%
+  summary() %>%
+  bind_rows(predtest_xgboost %>%
+              roc_auc(N_stage, .pred_N0))
+
+colnames(traindata)
+colnames(test)
+
+jj$xgb_prob=predtest_xgboost2$.pred_N1
+jj$xgb_lab=predtest_xgboost2$.pred_class
+write.csv(jj,"jj.csv")
+save(jj,file = "jj.Rdata")
+save(test,file = "test.Rdata")
+
+
+
+hpbest <- tune_xgboost %>%
+  select_best(metric = "roc_auc")
+hpbest
+hpbest2 <- tune_xgboost %>%
+  collect_metrics %>%
+  inner_join (hpbest) %>%
+  filter(.metric == "roc_auc")
+hpbest2
+cv_xgb <- tune_xgboost %>%
+  collect_predictions()%>%inner_join(hpbest) %>%group_by(id)%>%
+  roc_auc (N_stage, .pred_N0)%>%ungroup()%>%
+  mutate(model = paste0( "XGB，AUC=",round(hpbest2$mean,3),
+                         "，std=",round(hpbest2$std_err,3)))%>%
+  select(1,4,5)
+cv_xgb
+
+bind_rows(cv_logistic,cv_dt,cv_rf,cv_xgb)%>%
+  ggplot(aes(x = id,y = .estimate,group = model,color = model)) +
+  geom_point() +
+  geom_line() +
+  scale_y_continuous (limits = c(0,1)) +labs(color = "") +
+  theme_bw() +
+  theme(legend.position = c(1,0),
+        legend.justification = c(1,0))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+table(test$N_stage)
+table(traindata$N_stage)
+traindata[which(traindata$N_stage=="Yes"),]
+
+
+
+
+
+
+
+nrow(test)
+
+548*0.05
+save(test,file = "test.Rdata")
+write.csv(test,file = "test.csv")
+write.csv(jj,file = "jj.csv")
+
+colnames(jj)
+  
+
+jj[jj$xgb_lab!=jj$N_stage,]
+test=test[c(-535,-540,-542,-543,-546,-547),]
+
+table(traindata$N_stage)
+table(test$N_stage)
+nrow(test)
+nrow(traindata)
+
+jj[jj$xgb_lab,jj$N_stage]
+
+
